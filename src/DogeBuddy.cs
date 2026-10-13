@@ -20,7 +20,7 @@ using System.Web.Script.Serialization;
 
 [assembly: AssemblyTitle("DogeBuddy")]
 [assembly: AssemblyProduct("DogeBuddy")]
-[assembly: AssemblyVersion("1.11.0.0")]
+[assembly: AssemblyVersion("1.12.1.0")]
 
 namespace DogeBuddy
 {
@@ -242,12 +242,21 @@ namespace DogeBuddy
         int happyUntil, petTurns, petDir, petLastX, petFirstTick;
         bool Happy(int now) { return Before(now, happyUntil); }
 
+        // hover on the nose too long and it glares at you
+        int noseStart; bool noseGlare;
+        const int NoseMs = 2000;
+        static readonly RectangleF NoseArt = new RectangleF(25, 77, 25, 22); // in DogImage.png pixels
+
+        // gentle sway now and again
+        int swayStart, nextSwayTick;
+        const float SwayDeg = 1.3f, SwayPeriod = 2.6f, SwaySecs = 5.2f;
+
         // tilt / wobble (degrees, spring physics)
         float angle, angVel, dragVx, lastAngle; int lastPhysTick, lastDragTick, lastDragX;
         float pivotX = float.NaN, pivotY, grabLever = -1f;  // swing point (canvas px) and which way it swings
 
         // watching you type
-        int typingUntil; uint lastInputTime; Point typingCursor;
+        int typingUntil, lastClickTick; uint lastInputTime; Point typingCursor;
         volatile bool caretValid, caretBusy; volatile int caretX, caretY; int lastCaretQuery;
         bool Typing(int now) { return Before(now, typingUntil); }
 
@@ -287,6 +296,7 @@ namespace DogeBuddy
             bounds = new RectangleF(bounds.X - Geo.TiltPad, bounds.Y, bounds.Width + 2 * Geo.TiltPad, bounds.Height);
             lastMoveTick = Environment.TickCount;
             nextBlinkTick = lastMoveTick + 3000;
+            nextSwayTick = lastMoveTick + 20000 + rng.Next(20000);
             nextLookTick = lastMoveTick + 15000 + rng.Next(15000);
 
             BuildMenu();
@@ -543,6 +553,7 @@ namespace DogeBuddy
                 ox = dx / dist * m; oy = dy / dist * m;
             }
             int now = Environment.TickCount;
+            if (noseGlare) { ox = ClassicLook.X * cfg.Zoom; oy = ClassicLook.Y * cfg.Zoom; }
             bool looking = Before(now, lookUntil);
             int dt = lastEyeTick == 0 ? 1000 : Math.Max(0, Math.Min(200, now - lastEyeTick));
             lastEyeTick = now;
@@ -564,7 +575,7 @@ namespace DogeBuddy
             {
                 // normal tracking: ease towards the cursor instead of snapping
                 sweepBack = false;
-                float k = 1f - (float)Math.Exp(-dt / EyeLagMs);
+                float k = 1f - (float)Math.Exp(-dt / (noseGlare ? 220f : EyeLagMs));
                 eyeX += (ox - eyeX) * k; eyeY += (oy - eyeY) * k;
             }
             ox = (float)Math.Round(eyeX * 8) / 8f; oy = (float)Math.Round(eyeY * 8) / 8f;
@@ -754,11 +765,15 @@ namespace DogeBuddy
             var lii = new Native.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(Native.LASTINPUTINFO)) };
             if (!Native.GetLastInputInfo(ref lii)) return;
             Point c = Cursor.Position;
+            // mouse buttons only (left, right, middle, X1, X2): held now, or pressed since we last asked
+            foreach (int vk in new[] { 0x01, 0x02, 0x04, 0x05, 0x06 })
+                if ((Native.GetAsyncKeyState(vk) & 0x8001) != 0) lastClickTick = now;
             if (lii.dwTime != lastInputTime)
             {
                 bool mouseMoved = c != typingCursor;
-                bool buttons = (Control.MouseButtons != MouseButtons.None);
-                if (!mouseMoved && !buttons && lastInputTime != 0) typingUntil = NonZero(now + 1500);
+                bool clicked = now - lastClickTick < 300;
+                if (!mouseMoved && !clicked && lastInputTime != 0) typingUntil = NonZero(now + 1500);
+                if (clicked) typingUntil = 0;
                 if (mouseMoved) typingUntil = 0;     // grabbing the mouse hands attention back to it
                 lastInputTime = lii.dwTime;
             }
@@ -819,6 +834,23 @@ namespace DogeBuddy
         }
 
         // ------------------------------------------------------------ tilt & wobble
+        void UpdateNose()
+        {
+            int now = Environment.TickCount;
+            float k = body.Width / (float)srcBody.Width;
+            var nose = new RectangleF(winX + bodyPos.X + NoseArt.X * k, winY + bodyPos.Y + NoseArt.Y * k, NoseArt.Width * k, NoseArt.Height * k);
+            bool on = nose.Contains(Cursor.Position) && !leftDown && !dragging && sleepStart < 0 && !menuOpen && Math.Abs(angle) < 1f;
+            if (!on) { noseStart = 0; noseGlare = false; return; }
+            if (noseStart == 0) noseStart = NonZero(now);
+            if (now - noseStart > NoseMs)
+            {
+                // keep it miffed while you're still on the nose; it lets go shortly after you move off
+                noseGlare = true;
+                miffedUntil = NonZero(now + 350);
+                happyUntil = 0;
+            }
+        }
+
         void UpdateTilt()
         {
             int now = Environment.TickCount;
@@ -827,6 +859,20 @@ namespace DogeBuddy
             if (dragging && now - lastDragTick > 60) dragVx *= (float)Math.Exp(-dt / 0.08f); // stopped moving
             // the part away from your grab lags behind: held by the head the body swings, held by the feet the head tips
             float target = dragging ? Math.Max(-Geo.MaxTilt, Math.Min(Geo.MaxTilt, dragVx * 0.006f * grabLever)) : 0f;
+
+            // idle sway: a couple of slow side-to-side rocks from the feet, every 40-90 s while awake
+            bool calm = !dragging && !leftDown && sleepStart < 0 && !Miffed(now) && !Happy(now) && !menuOpen;
+            if (swayStart == 0 && now - nextSwayTick >= 0)
+            {
+                if (calm && Math.Abs(angle) < 0.1f && Math.Abs(angVel) < 1f) { swayStart = NonZero(now); pivotX = float.NaN; }
+                else nextSwayTick = now + 5000;
+            }
+            if (swayStart != 0)
+            {
+                float t = (now - swayStart) / 1000f;
+                if (!calm || t > SwaySecs) { swayStart = 0; nextSwayTick = now + 40000 + rng.Next(50000); }
+                else target = SwayDeg * (float)(Math.Sin(2 * Math.PI * t / SwayPeriod) * Math.Sin(Math.PI * t / SwaySecs));
+            }
             // underdamped spring: leans into the drag, wobbles back upright when dropped
             float acc = 170f * (target - angle) - 11f * angVel;
             angVel += acc * dt;
@@ -841,6 +887,7 @@ namespace DogeBuddy
             if (++tickCount % 8 == 0) CheckZOrderAndFullscreen();   // ~4x per second
             if (hidden) return;
             UpdateTyping();
+            UpdateNose();
             UpdateTilt();
             UpdateBlinkAndSleep();
             if (sleepStart >= 0 && blinkStart < 0 && Environment.TickCount - sleepStart > 3000 && tickCount % 3 != 0) return; // ~10 fps while asleep
@@ -1301,6 +1348,7 @@ namespace DogeBuddy
             public RECT rcCaret;
         }
         [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO lii);
+        [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vk);
         [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO gti);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);

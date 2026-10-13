@@ -11,7 +11,8 @@ Originally a Rainmeter skin (*DogeEyes*), rebuilt as a standalone Windows app. *
 - 👀 Eyes follow your cursor, and every so often it gives *you* the classic doge look
 - 👔 7 outfits: Army, Business, Hoodie, Chef, Vault Dweller, Astro, Tropical
 - 😑 Blinks now and then, and naps (with z's) when you leave the mouse alone
-- 😒 Gets miffed if you poke it, shake it, or wake it up rudely
+- 😒 Gets miffed if you poke it, shake it, wake it up rudely, or park your cursor on its nose
+- 🌿 Sways gently in place now and then
 - ⌨️ Glances at your text cursor while you type
 - 🤚 Rub its head and it gets happy
 - 😮 Opens its mouth when you pick it up, leans as you carry it, and wobbles when you put it down
@@ -35,6 +36,7 @@ Windows SmartScreen may warn you the first time because the exe isn't code-signe
 | Type anywhere | It watches your text cursor |
 | Rub the cursor back and forth over its head | Happy doge |
 | Click it 3 times quickly | It gets miffed |
+| Leave the cursor on its nose | After a couple of seconds it glares at you until you move off |
 | Shake it while dragging | It gets miffed when you let go |
 | Click it while it's asleep or groggy | Rude awakening: it wakes up miffed |
 
