@@ -17,7 +17,7 @@ for %%f in (art\*.png art\*.ico) do set "RES=!RES! /resource:%%f,%%~nxf"
 if not exist dist mkdir dist
 "%CSC%" /nologo /target:winexe /optimize+ /platform:anycpu ^
   /out:dist\DogeBuddy.exe /win32icon:art\doge.ico ^
-  /reference:System.Windows.Forms.dll /reference:System.Drawing.dll ^
+  /reference:System.Windows.Forms.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:Accessibility.dll ^
   %RES% src\DogeBuddy.cs
 if errorlevel 1 (
   echo Build failed.

@@ -6,33 +6,68 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
+using System.Diagnostics;
 using System.IO;
+using System.Net;
+using System.Security.Cryptography;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using System.Web.Script.Serialization;
 
 [assembly: AssemblyTitle("DogeBuddy")]
 [assembly: AssemblyProduct("DogeBuddy")]
-[assembly: AssemblyVersion("1.7.0.0")]
+[assembly: AssemblyVersion("1.11.0.0")]
 
 namespace DogeBuddy
 {
     static class Program
     {
+        public static bool JustUpdated;
+
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
-            bool created;
-            using (var mutex = new Mutex(true, "DogeBuddy_SingleInstance_7f3a", out created))
+            JustUpdated = Array.IndexOf(args, "--updated") >= 0;
+            using (var mutex = new Mutex(false, "DogeBuddy_SingleInstance_7f3a"))
+            using (var quit = new EventWaitHandle(false, EventResetMode.AutoReset, "DogeBuddy_Quit_7f3a"))
             {
-                if (!created) return;
-                try { Native.SetProcessDPIAware(); } catch { }
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new PetForm());
+                bool owned;
+                try { owned = mutex.WaitOne(JustUpdated ? 10000 : 0); }
+                catch (AbandonedMutexException) { owned = true; }
+                if (!owned)
+                {
+                    // already running: ask that copy to close, and take over (newest launch wins)
+                    quit.Set();
+                    try { owned = mutex.WaitOne(6000); }
+                    catch (AbandonedMutexException) { owned = true; }
+                    if (!owned)
+                    {
+                        MessageBox.Show("An older DogeBuddy is still running and didn't close.\n\nRight-click the doge, choose Exit, then start this one again.",
+                            "DogeBuddy", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
+                }
+                quit.Reset();
+                try
+                {
+                    Updater.CleanUpOld();
+                    try { Native.SetProcessDPIAware(); } catch { }
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    var form = new PetForm();
+                    var listener = new Thread(() =>
+                    {
+                        quit.WaitOne();
+                        try { form.BeginInvoke((Action)form.Close); } catch { }
+                    }) { IsBackground = true };
+                    listener.Start();
+                    Application.Run(form);
+                }
+                finally { mutex.ReleaseMutex(); }
             }
         }
     }
@@ -47,6 +82,7 @@ namespace DogeBuddy
         public bool HideFullscreen = true;
         public bool Tray = true;
         public int NapMinutes = 2;      // 0 = never
+        public int LayoutVer = 1;       // 2 = window has side padding for tilting
 
         static string AppData { get { return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } }
         static string Dir { get { return Path.Combine(AppData, "DogeBuddy"); } }
@@ -77,6 +113,7 @@ namespace DogeBuddy
                         case "HideFullscreen": s.HideFullscreen = v == "1"; break;
                         case "Tray": s.Tray = v == "1"; break;
                         case "NapMinutes": int.TryParse(v, out s.NapMinutes); break;
+                        case "LayoutVer": int.TryParse(v, out s.LayoutVer); break;
                     }
                 }
             }
@@ -101,6 +138,7 @@ namespace DogeBuddy
                 sb.AppendLine("HideFullscreen=" + (HideFullscreen ? 1 : 0));
                 sb.AppendLine("Tray=" + (Tray ? 1 : 0));
                 sb.AppendLine("NapMinutes=" + NapMinutes);
+                sb.AppendLine("LayoutVer=" + LayoutVer);
                 File.WriteAllText(FilePath, sb.ToString());
             }
             catch { }
@@ -115,6 +153,8 @@ namespace DogeBuddy
         public static readonly RectangleF Eyes = new RectangleF(40.2f * S, 85 * S - 1, 83 * S, 53 * S); // raised 1px so up/down look balanced
         public const float EyeMax = 5 * S;   // max pupil travel
         public const float EyeDiv = 12 * S;  // distance divisor near the eyes
+        public const float TiltPad = 28;     // spare room either side so the doge can lean
+        public const float MaxTilt = 6;      // degrees
 
         public static readonly string[] OutfitNames = {
             "No outfit", "Army Doge", "Business Doge", "Hoodie Doge", "Chef Doge",
@@ -148,12 +188,12 @@ namespace DogeBuddy
     class PetForm : Form
     {
         Settings cfg;
-        Bitmap srcBody, srcHover, srcEyes, srcHalf, srcClosed, srcMiffed;
+        Bitmap srcBody, srcHover, srcEyes, srcHalf, srcClosed, srcMiffed, srcHappy;
         Bitmap[] srcOutfits = new Bitmap[OutfitCount + 1];
         const int OutfitCount = 7;
 
         // scaled assets for current zoom
-        Bitmap body, hover, eyes, outfit, half, closed, miffed;
+        Bitmap body, hover, eyes, outfit, half, closed, miffed, happy;
         PointF bodyPos, eyesPos, outfitPos;
         PointF eyeCenter;
         float eyeMax, eyeDiv;
@@ -183,11 +223,33 @@ namespace DogeBuddy
         List<int> pokes = new List<int>();       // recent click times
         int shakeTurns, shakeDir, shakeLastX;    // direction changes while dragging
         bool clickWoke;                          // this click woke it up; don't count it as a poke
-        bool lastMiffed;
+        bool lastMiffed, lastHappy;
 
         // smoothed eyes
         float eyeX, eyeY; int lastEyeTick;
         const float EyeLagMs = 90f;              // higher = lazier eyes
+
+        // now and then it stops tracking and gives you the classic doge look
+        static readonly PointF ClassicLook = new PointF(1.5f, 1.25f); // pupil offset at Normal size
+        int lookUntil, nextLookTick, sweepStart;
+        float sweepFromX, sweepFromY;
+        bool sweepBack, idleLook;
+        const int IdleLookMs = 30000;          // after this long with no mouse/keyboard, hold the classic look
+        const int SweepInMs = 900, SweepOutMs = 700;
+        Point lookCursor;
+
+        // petting
+        int happyUntil, petTurns, petDir, petLastX, petFirstTick;
+        bool Happy(int now) { return Before(now, happyUntil); }
+
+        // tilt / wobble (degrees, spring physics)
+        float angle, angVel, dragVx, lastAngle; int lastPhysTick, lastDragTick, lastDragX;
+        float pivotX = float.NaN, pivotY, grabLever = -1f;  // swing point (canvas px) and which way it swings
+
+        // watching you type
+        int typingUntil; uint lastInputTime; Point typingCursor;
+        volatile bool caretValid, caretBusy; volatile int caretX, caretY; int lastCaretQuery;
+        bool Typing(int now) { return Before(now, typingUntil); }
 
         static bool Before(int now, int deadline) { return deadline != 0 && deadline - now > 0; }
         bool Miffed(int now) { return Before(now, miffedUntil); }
@@ -215,14 +277,17 @@ namespace DogeBuddy
             srcHalf = LoadPng("DogBlinkHalf.png");
             srcClosed = LoadPng("DogBlinkClosed.png");
             srcMiffed = LoadPng("DogMiffed.png");
+            srcHappy = LoadPng("DogHappy.png");
             for (int i = 1; i <= OutfitCount; i++) srcOutfits[i] = LoadPng("Clothing" + i + ".png");
 
             // union of every layer so the doge's feet stay put whatever it wears
             bounds = Geo.BodyRect(srcBody.Size);
             bounds = RectangleF.Union(bounds, Geo.Eyes);
             for (int i = 1; i <= OutfitCount; i++) bounds = RectangleF.Union(bounds, Geo.OutfitRect(i, srcOutfits[i].Size));
+            bounds = new RectangleF(bounds.X - Geo.TiltPad, bounds.Y, bounds.Width + 2 * Geo.TiltPad, bounds.Height);
             lastMoveTick = Environment.TickCount;
             nextBlinkTick = lastMoveTick + 3000;
+            nextLookTick = lastMoveTick + 15000 + rng.Next(15000);
 
             BuildMenu();
             tray = new NotifyIcon { Icon = appIcon, Text = "DogeBuddy", ContextMenuStrip = menu, Visible = cfg.Tray };
@@ -234,6 +299,64 @@ namespace DogeBuddy
             timer.Tick += OnTick;
             SystemEvents.DisplaySettingsChanged += (s, e) => BeginInvoke((Action)ClampToScreen);
             RefreshStartupPath();
+
+        }
+
+        // ------------------------------------------------------------ updates
+        bool updateBusy;
+
+        void CheckForUpdates(bool manual)
+        {
+            if (updateBusy) return;
+            updateBusy = true;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                Updater.Release rel = null; string err = null;
+                try { rel = Updater.GetLatest(); } catch (Exception ex) { err = ex.Message; }
+                BeginInvoke((Action)(() =>
+                {
+                    updateBusy = false;
+                    if (rel == null)
+                    {
+                        if (manual) MessageBox.Show(this, "Couldn't reach GitHub to check for updates.\n\n" + err, "DogeBuddy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    if (rel.Version <= Updater.Current)
+                    {
+                        if (manual) MessageBox.Show(this, "You're on the latest version (v" + Updater.Short(Updater.Current) + ").", "DogeBuddy", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        return;
+                    }
+                    string notes = (rel.Notes ?? "").Trim();
+                    if (notes.Length > 400) notes = notes.Substring(0, 400) + "...";
+                    var ask = MessageBox.Show(this,
+                        "DogeBuddy v" + Updater.Short(rel.Version) + " is out (you have v" + Updater.Short(Updater.Current) + ").\n\n" +
+                        (notes.Length > 0 ? notes + "\n\n" : "") + "Update now? DogeBuddy will restart.",
+                        "DogeBuddy update", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                    if (ask == DialogResult.Yes) InstallUpdate(rel);
+                }));
+            });
+        }
+
+        void InstallUpdate(Updater.Release rel)
+        {
+            updateBusy = true;
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                string err = null;
+                try { Updater.DownloadAndSwap(rel); } catch (Exception ex) { err = ex.Message; }
+                BeginInvoke((Action)(() =>
+                {
+                    updateBusy = false;
+                    if (err != null)
+                    {
+                        MessageBox.Show(this, "The update didn't install, so nothing was changed.\n\n" + err, "DogeBuddy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    try { Process.Start(Application.ExecutablePath, "--updated"); }
+                    catch (Exception ex) { MessageBox.Show(this, "Updated, but couldn't restart: " + ex.Message, "DogeBuddy"); }
+                    Close();
+                }));
+            });
         }
 
         static Stream Res(string name)
@@ -270,6 +393,8 @@ namespace DogeBuddy
             base.OnLoad(e);
             Render(true);
             timer.Start();
+            if (Program.JustUpdated && tray.Visible)
+                tray.ShowBalloonTip(4000, "DogeBuddy", "Updated to v" + Updater.Short(Updater.Current), ToolTipIcon.Info);
         }
 
         // ------------------------------------------------------------ scaling
@@ -295,13 +420,14 @@ namespace DogeBuddy
         void ApplyZoom()
         {
             float z = cfg.Zoom;
-            DisposeIf(ref body); DisposeIf(ref hover); DisposeIf(ref eyes); DisposeIf(ref half); DisposeIf(ref closed); DisposeIf(ref miffed);
+            DisposeIf(ref body); DisposeIf(ref hover); DisposeIf(ref eyes); DisposeIf(ref half); DisposeIf(ref closed); DisposeIf(ref miffed); DisposeIf(ref happy);
             body = Scale(srcBody, Geo.BodyRect(srcBody.Size), z, out bodyPos, bounds);
             PointF dummy;
             hover = Scale(srcHover, Geo.BodyRect(srcHover.Size), z, out dummy, bounds);
             half = Scale(srcHalf, Geo.BodyRect(srcHalf.Size), z, out dummy, bounds);
             closed = Scale(srcClosed, Geo.BodyRect(srcClosed.Size), z, out dummy, bounds);
             miffed = Scale(srcMiffed, Geo.BodyRect(srcMiffed.Size), z, out dummy, bounds);
+            happy = Scale(srcHappy, Geo.BodyRect(srcHappy.Size), z, out dummy, bounds);
             eyes = Scale(srcEyes, Geo.Eyes, z, out eyesPos, bounds);
             eyeCenter = new PointF(eyesPos.X + eyes.Width / 2f, eyesPos.Y + eyes.Height / 2f);
             eyeMax = Geo.EyeMax * z;
@@ -356,6 +482,12 @@ namespace DogeBuddy
         // ------------------------------------------------------------ positioning
         void PlaceInitial()
         {
+            if (cfg.LayoutVer < 2)
+            {
+                // the window got wider on both sides; keep the doge where it was
+                if (cfg.X != int.MinValue) cfg.X -= (int)Math.Round(Geo.TiltPad * cfg.Zoom);
+                cfg.LayoutVer = 2; cfg.Save();
+            }
             if (cfg.X == int.MinValue || !OnAnyScreen(new Rectangle(cfg.X, cfg.Y, cw, ch)))
                 DefaultPosition();
             else { winX = cfg.X; winY = cfg.Y; }
@@ -400,6 +532,7 @@ namespace DogeBuddy
         {
             if (canvas == null || !IsHandleCreated) return;
             Point c = Cursor.Position;
+            if (Typing(Environment.TickCount) && caretValid) c = new Point(caretX, caretY);
             float ex = winX + eyeCenter.X, ey = winY + eyeCenter.Y;
             float dx = c.X - ex, dy = c.Y - ey;
             float dist = (float)Math.Sqrt(dx * dx + dy * dy);
@@ -410,19 +543,40 @@ namespace DogeBuddy
                 ox = dx / dist * m; oy = dy / dist * m;
             }
             int now = Environment.TickCount;
-            // ease the pupils towards the cursor instead of snapping
+            bool looking = Before(now, lookUntil);
             int dt = lastEyeTick == 0 ? 1000 : Math.Max(0, Math.Min(200, now - lastEyeTick));
             lastEyeTick = now;
-            float k = 1f - (float)Math.Exp(-dt / EyeLagMs);
-            eyeX += (ox - eyeX) * k; eyeY += (oy - eyeY) * k;
-            ox = (float)Math.Round(eyeX * 4) / 4f; oy = (float)Math.Round(eyeY * 4) / 4f;
+            if (looking)
+            {
+                // slow, even sweep over to the classic look
+                float e = Ease((now - sweepStart) / (float)SweepInMs);
+                eyeX = sweepFromX + (ClassicLook.X * cfg.Zoom - sweepFromX) * e;
+                eyeY = sweepFromY + (ClassicLook.Y * cfg.Zoom - sweepFromY) * e;
+            }
+            else if (sweepBack && now - sweepStart < SweepOutMs)
+            {
+                // and a slow sweep back to wherever the cursor is
+                float e = Ease((now - sweepStart) / (float)SweepOutMs);
+                eyeX = sweepFromX + (ox - sweepFromX) * e;
+                eyeY = sweepFromY + (oy - sweepFromY) * e;
+            }
+            else
+            {
+                // normal tracking: ease towards the cursor instead of snapping
+                sweepBack = false;
+                float k = 1f - (float)Math.Exp(-dt / EyeLagMs);
+                eyeX += (ox - eyeX) * k; eyeY += (oy - eyeY) * k;
+            }
+            ox = (float)Math.Round(eyeX * 8) / 8f; oy = (float)Math.Round(eyeY * 8) / 8f;
 
             bool hov = dragging; // mouth open only while being carried around
             bool mf = !dragging && Miffed(now);
+            bool hp = !dragging && !mf && Happy(now);
+            float ang = (float)Math.Round(angle * 10) / 10f;
             float lid = LidAmount(now);
             int zf = sleepStart >= 0 && now - sleepStart > 2500 ? ((now - sleepStart) / 100) : -1;
-            if (!force && ox == lastDx && oy == lastDy && hov == lastHover && lid == lastLid && zf == lastZ && mf == lastMiffed) return;
-            lastDx = ox; lastDy = oy; lastHover = hov; lastLid = lid; lastZ = zf; lastMiffed = mf;
+            if (!force && ox == lastDx && oy == lastDy && hov == lastHover && lid == lastLid && zf == lastZ && mf == lastMiffed && hp == lastHappy && ang == lastAngle) return;
+            lastDx = ox; lastDy = oy; lastHover = hov; lastLid = lid; lastZ = zf; lastMiffed = mf; lastHappy = hp; lastAngle = ang;
 
             using (var g = Graphics.FromImage(canvas))
             {
@@ -431,11 +585,21 @@ namespace DogeBuddy
                 g.CompositingMode = CompositingMode.SourceOver;
                 g.InterpolationMode = InterpolationMode.Bilinear;
                 g.PixelOffsetMode = PixelOffsetMode.Half;
+                if (ang != 0)
+                {
+                    // lean around the feet
+                    // swing around wherever it was grabbed (feet until the first grab)
+                    float px = float.IsNaN(pivotX) ? bodyPos.X + body.Width / 2f : pivotX;
+                    float py = float.IsNaN(pivotX) ? bodyPos.Y + body.Height : pivotY;
+                    g.TranslateTransform(px, py); g.RotateTransform(ang); g.TranslateTransform(-px, -py);
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                }
                 g.DrawImage(eyes, eyesPos.X + ox, eyesPos.Y + oy, eyes.Width, eyes.Height);
-                g.InterpolationMode = InterpolationMode.NearestNeighbor;
-                Bitmap face = hov ? hover : mf ? miffed : lid >= 0.75f ? closed : lid > 0.25f ? half : body;
-                g.DrawImageUnscaled(face, (int)bodyPos.X, (int)bodyPos.Y);
-                if (outfit != null) g.DrawImageUnscaled(outfit, (int)outfitPos.X, (int)outfitPos.Y);
+                g.InterpolationMode = ang != 0 ? InterpolationMode.Bilinear : InterpolationMode.NearestNeighbor;
+                Bitmap face = hov ? hover : mf ? miffed : hp ? happy : lid >= 0.75f ? closed : lid > 0.25f ? half : body;
+                g.DrawImage(face, (int)bodyPos.X, (int)bodyPos.Y, face.Width, face.Height);
+                if (outfit != null) g.DrawImage(outfit, (int)outfitPos.X, (int)outfitPos.Y, outfit.Width, outfit.Height);
+                g.ResetTransform();
                 if (zf >= 0) DrawZzz(g, now - sleepStart - 2500);
             }
             Native.GdiFlush();
@@ -454,7 +618,7 @@ namespace DogeBuddy
         {
             int now = Environment.TickCount;
             Point c = Cursor.Position;
-            if (c != lastCursor || dragging || menuOpen)
+            if (c != lastCursor || dragging || menuOpen || Typing(now))
             {
                 lastCursor = c;
                 lastMoveTick = now;
@@ -476,6 +640,37 @@ namespace DogeBuddy
                 miffedUntil = 0;
                 nextBlinkTick = now + 400;           // a blink to reset the face
             }
+            // the look: every 20-45 s while awake and idle-ish; moving the mouse a lot breaks it
+            if (lookUntil != 0)
+            {
+                Point lc = Cursor.Position;
+                int moved = Math.Abs(lc.X - lookCursor.X) + Math.Abs(lc.Y - lookCursor.Y);
+                // the idle look holds until you touch the mouse or keyboard (or it nods off); the random one is brief
+                bool broke = moved > (idleLook ? 3 : 200) || (idleLook && Typing(now)) || dragging || Miffed(now) || Happy(now) || sleepStart >= 0;
+                if (broke || !Before(now, lookUntil))
+                {
+                    lookUntil = 0; idleLook = false;
+                    sweepStart = now; sweepFromX = eyeX; sweepFromY = eyeY; sweepBack = true;
+                    nextLookTick = now + 20000 + rng.Next(25000);
+                }
+            }
+            else if (now - lastMoveTick > IdleLookMs && sleepStart < 0 && !Groggy(now) && !Miffed(now) && !Happy(now) && !dragging && !menuOpen)
+            {
+                idleLook = true;
+                lookUntil = NonZero(now + 10 * 86400000);
+                sweepStart = now; sweepFromX = eyeX; sweepFromY = eyeY; sweepBack = false;
+                lookCursor = Cursor.Position;
+            }
+            else if (now - nextLookTick >= 0)
+            {
+                if (sleepStart < 0 && !Groggy(now) && !Miffed(now) && !Happy(now) && !Typing(now) && !dragging && !menuOpen)
+                {
+                    lookUntil = now + 2600 + rng.Next(1500); if (lookUntil == 0) lookUntil = 1;
+                    sweepStart = now; sweepFromX = eyeX; sweepFromY = eyeY; sweepBack = false;
+                    lookCursor = Cursor.Position;
+                }
+                else nextLookTick = now + 5000;
+            }
             if (sleepStart < 0 && !Groggy(now) && !Miffed(now) && cfg.NapMinutes > 0 && now - lastMoveTick > cfg.NapMinutes * 60000)
             {
                 sleepStart = now;
@@ -484,7 +679,7 @@ namespace DogeBuddy
             if (sleepStart < 0)
             {
                 if (blinkStart >= 0 && now - blinkStart >= BlinkMs) blinkStart = -1;
-                if (blinkStart < 0 && now - nextBlinkTick >= 0 && !lastHover && !Miffed(now) && !Groggy(now))
+                if (blinkStart < 0 && now - nextBlinkTick >= 0 && !lastHover && !Miffed(now) && !Groggy(now) && !Happy(now))
                 {
                     blinkStart = now;
                     // sometimes a quick double blink
@@ -551,11 +746,102 @@ namespace DogeBuddy
             return ((px >> 24) & 0xFF) > 0;
         }
 
+        // ------------------------------------------------------------ watching you type
+        // No keyboard hook: if Windows reports fresh input but the mouse hasn't moved, it was the keyboard.
+        void UpdateTyping()
+        {
+            int now = Environment.TickCount;
+            var lii = new Native.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(Native.LASTINPUTINFO)) };
+            if (!Native.GetLastInputInfo(ref lii)) return;
+            Point c = Cursor.Position;
+            if (lii.dwTime != lastInputTime)
+            {
+                bool mouseMoved = c != typingCursor;
+                bool buttons = (Control.MouseButtons != MouseButtons.None);
+                if (!mouseMoved && !buttons && lastInputTime != 0) typingUntil = NonZero(now + 1500);
+                if (mouseMoved) typingUntil = 0;     // grabbing the mouse hands attention back to it
+                lastInputTime = lii.dwTime;
+            }
+            typingCursor = c;
+            if (Typing(now) && !caretBusy && now - lastCaretQuery > 150)
+            {
+                lastCaretQuery = now;
+                caretBusy = true;
+                ThreadPool.QueueUserWorkItem(_ => { try { QueryCaret(); } finally { caretBusy = false; } });
+            }
+        }
+
+        static int NonZero(int t) { return t == 0 ? 1 : t; }
+
+        // Where is the text cursor? 1) classic Win32 caret, 2) accessibility caret (browsers, Electron),
+        // 3) otherwise the middle of the focused control.
+        void QueryCaret()
+        {
+            try
+            {
+                IntPtr fg = Native.GetForegroundWindow();
+                if (fg == IntPtr.Zero || fg == Handle) { caretValid = false; return; }
+                uint pid;
+                uint tid = Native.GetWindowThreadProcessId(fg, out pid);
+                var gti = new Native.GUITHREADINFO { cbSize = Marshal.SizeOf(typeof(Native.GUITHREADINFO)) };
+                IntPtr focus = fg;
+                if (Native.GetGUIThreadInfo(tid, ref gti))
+                {
+                    if (gti.hwndFocus != IntPtr.Zero) focus = gti.hwndFocus;
+                    var r = gti.rcCaret;
+                    if (gti.hwndCaret != IntPtr.Zero && (r.right > r.left || r.bottom > r.top))
+                    {
+                        var p = new Native.POINT { x = r.left, y = (r.top + r.bottom) / 2 };
+                        Native.ClientToScreen(gti.hwndCaret, ref p);
+                        caretX = p.x; caretY = p.y; caretValid = true; return;
+                    }
+                }
+                try
+                {
+                    object acc;
+                    Guid iid = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71"); // IAccessible
+                    if (Native.AccessibleObjectFromWindow(focus, 0xFFFFFFF8 /* OBJID_CARET */, ref iid, out acc) == 0 && acc != null)
+                    {
+                        int l, t, w, h;
+                        ((Accessibility.IAccessible)acc).accLocation(out l, out t, out w, out h, 0);
+                        if (w > 0 || h > 0) { caretX = l; caretY = t + h / 2; caretValid = true; return; }
+                    }
+                }
+                catch { }
+                Native.RECT fr;
+                if (Native.GetWindowRect(focus, out fr) && fr.right > fr.left)
+                {
+                    caretX = (fr.left + fr.right) / 2; caretY = (fr.top + fr.bottom) / 2; caretValid = true; return;
+                }
+                caretValid = false;
+            }
+            catch { caretValid = false; }
+        }
+
+        // ------------------------------------------------------------ tilt & wobble
+        void UpdateTilt()
+        {
+            int now = Environment.TickCount;
+            float dt = lastPhysTick == 0 ? 0.033f : Math.Max(0.001f, Math.Min(0.05f, (now - lastPhysTick) / 1000f));
+            lastPhysTick = now;
+            if (dragging && now - lastDragTick > 60) dragVx *= (float)Math.Exp(-dt / 0.08f); // stopped moving
+            // the part away from your grab lags behind: held by the head the body swings, held by the feet the head tips
+            float target = dragging ? Math.Max(-Geo.MaxTilt, Math.Min(Geo.MaxTilt, dragVx * 0.006f * grabLever)) : 0f;
+            // underdamped spring: leans into the drag, wobbles back upright when dropped
+            float acc = 170f * (target - angle) - 11f * angVel;
+            angVel += acc * dt;
+            angle += angVel * dt;
+            angle = Math.Max(-Geo.MaxTilt - 2, Math.Min(Geo.MaxTilt + 2, angle));
+            if (!dragging && Math.Abs(angle) < 0.05f && Math.Abs(angVel) < 0.5f) { angle = 0; angVel = 0; }
+        }
+
         // ------------------------------------------------------------ main loop
         void OnTick(object sender, EventArgs e)
         {
             if (++tickCount % 8 == 0) CheckZOrderAndFullscreen();   // ~4x per second
             if (hidden) return;
+            UpdateTyping();
+            UpdateTilt();
             UpdateBlinkAndSleep();
             if (sleepStart >= 0 && blinkStart < 0 && Environment.TickCount - sleepStart > 3000 && tickCount % 3 != 0) return; // ~10 fps while asleep
             Render(false);
@@ -621,7 +907,15 @@ namespace DogeBuddy
             if (e.Button == MouseButtons.Left)
             {
                 leftDown = true; dragging = false;
+                dragVx = 0; lastDragTick = 0;
                 dragStart = Cursor.Position; winStart = new Point(winX, winY);
+                if (Math.Abs(angle) < 0.5f)
+                {
+                    // new swing point = the grabbed pixel; lever: +1 grabbed at the top, -1 at the feet, ~0 in the middle
+                    pivotX = dragStart.X - winX; pivotY = dragStart.Y - winY;
+                    float com = bodyPos.Y + body.Height * 0.55f;
+                    grabLever = Math.Max(-1f, Math.Min(1f, (com - pivotY) / (body.Height * 0.45f)));
+                }
                 shakeTurns = 0; shakeDir = 0; shakeLastX = dragStart.X;
                 Capture = true;
                 int now = Environment.TickCount;
@@ -640,8 +934,14 @@ namespace DogeBuddy
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            if (!leftDown || cfg.Locked) return;
+            if (!leftDown) { Pet(); return; }
+            if (cfg.Locked) return;
             Point c = Cursor.Position;
+            {
+                int now = Environment.TickCount, dtm = Math.Max(1, now - lastDragTick);
+                if (lastDragTick != 0 && dtm < 200) dragVx = dragVx * 0.6f + 0.4f * ((c.X - lastDragX) * 1000f / dtm);
+                lastDragTick = now; lastDragX = c.X;
+            }
             if (!dragging && (Math.Abs(c.X - dragStart.X) > 3 || Math.Abs(c.Y - dragStart.Y) > 3)) dragging = true;
             if (dragging)
             {
@@ -652,6 +952,28 @@ namespace DogeBuddy
                 else if (d * shakeDir > 0) shakeLastX = c.X;
                 else if (Math.Abs(d) >= 25) { shakeTurns++; shakeDir = -shakeDir; shakeLastX = c.X; }
                 MoveTo(winStart.X + c.X - dragStart.X, winStart.Y + c.Y - dragStart.Y);
+            }
+        }
+
+        // rub back and forth over the head
+        void Pet()
+        {
+            Point c = Cursor.Position;
+            int now = Environment.TickCount;
+            float headBottom = winY + bodyPos.Y + body.Height * 0.42f;
+            if (c.Y > headBottom || !IsOverPet(c)) { petTurns = 0; petDir = 0; return; }
+            int swing = (int)Math.Max(4, 6 * cfg.Zoom);
+            int d = c.X - petLastX;
+            if (petDir == 0) { if (Math.Abs(d) >= swing) { petDir = Math.Sign(d); petLastX = c.X; } else if (petLastX == 0) petLastX = c.X; return; }
+            if (d * petDir > 0) { petLastX = c.X; return; }
+            if (Math.Abs(d) < swing) return;
+            petDir = -petDir; petLastX = c.X;
+            if (petTurns == 0 || now - petFirstTick > 1600) { petTurns = 0; petFirstTick = now; }
+            petTurns++;
+            if (petTurns >= 3)
+            {
+                happyUntil = NonZero(now + 2000);   // keeps extending while you keep petting
+                miffedUntil = 0; groggyUntil = 0; sleepStart = -1; blinkStart = -1;
             }
         }
 
@@ -780,6 +1102,9 @@ namespace DogeBuddy
             menu.Items.Add(miStartup);
             menu.Items.Add(miTray);
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(new ToolStripMenuItem("Check for updates...", null, (s, e) => CheckForUpdates(true)));
+            menu.Items.Add(new ToolStripMenuItem("DogeBuddy v" + Updater.Short(Updater.Current)) { Enabled = false });
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Exit", null, (s, e) => Close()));
         }
 
@@ -857,6 +1182,94 @@ namespace DogeBuddy
         }
     }
 
+    // ---------------------------------------------------------------- updater
+    // Asks GitHub for the latest release, downloads DogeBuddy.exe, checks it against the
+    // release's SHA256SUMS.txt, then swaps it in (a running exe can be renamed, not overwritten).
+    static class Updater
+    {
+        const string DefaultApi = "https://api.github.com/repos/SnazzyGaz/DogeBuddy/releases/latest";
+        // for local testing only: point at a fake release feed
+        static string Api { get { return Environment.GetEnvironmentVariable("DOGEBUDDY_UPDATE_API") ?? DefaultApi; } }
+
+        public static Version Current { get { return Assembly.GetExecutingAssembly().GetName().Version; } }
+        public static string Short(Version v) { return v.Major + "." + v.Minor + "." + Math.Max(0, v.Build); }
+
+        public class Release { public Version Version; public string Notes, ExeUrl, SumsUrl; }
+
+        static WebClient Client()
+        {
+            ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2
+            var wc = new WebClient();
+            wc.Headers[HttpRequestHeader.UserAgent] = "DogeBuddy/" + Short(Current);
+            return wc;
+        }
+
+        public static Release GetLatest()
+        {
+            string json;
+            using (var wc = Client()) { wc.Headers[HttpRequestHeader.Accept] = "application/vnd.github+json"; json = wc.DownloadString(Api); }
+            var d = (Dictionary<string, object>)new JavaScriptSerializer().DeserializeObject(json);
+            var rel = new Release();
+            string tag = ((d["tag_name"] as string) ?? "").TrimStart('v', 'V');
+            Version v;
+            if (!Version.TryParse(tag, out v)) throw new Exception("Unrecognised version tag: " + tag);
+            rel.Version = new Version(v.Major, v.Minor, Math.Max(0, v.Build), 0);
+            object body; if (d.TryGetValue("body", out body)) rel.Notes = body as string;
+            foreach (var o in (object[])d["assets"])
+            {
+                var a = (Dictionary<string, object>)o;
+                string name = (a["name"] as string) ?? "", url = a["browser_download_url"] as string;
+                if (name.Equals("DogeBuddy.exe", StringComparison.OrdinalIgnoreCase)) rel.ExeUrl = url;
+                if (name.Equals("SHA256SUMS.txt", StringComparison.OrdinalIgnoreCase)) rel.SumsUrl = url;
+            }
+            if (rel.ExeUrl == null || rel.SumsUrl == null) throw new Exception("The latest release is missing DogeBuddy.exe or SHA256SUMS.txt.");
+            return rel;
+        }
+
+        public static void DownloadAndSwap(Release rel)
+        {
+            string exe = Application.ExecutablePath;
+            string tmp = exe + ".download", old = exe + ".old";
+
+            string sums;
+            using (var wc = Client()) sums = wc.DownloadString(rel.SumsUrl);
+            string expected = null;
+            foreach (var line in sums.Split('\n'))
+            {
+                var parts = line.Trim().Split(new[] { ' ', '*' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 2 && parts[1].Equals("DogeBuddy.exe", StringComparison.OrdinalIgnoreCase)) expected = parts[0].ToLowerInvariant();
+            }
+            if (expected == null || expected.Length != 64) throw new Exception("SHA256SUMS.txt has no hash for DogeBuddy.exe.");
+
+            try { File.Delete(tmp); } catch { }
+            using (var wc = Client()) wc.DownloadFile(rel.ExeUrl, tmp);
+
+            byte[] data = File.ReadAllBytes(tmp);
+            string actual;
+            using (var sha = SHA256.Create()) actual = BitConverter.ToString(sha.ComputeHash(data)).Replace("-", "").ToLowerInvariant();
+            if (actual != expected || data.Length < 1024 || data[0] != 'M' || data[1] != 'Z')
+            {
+                try { File.Delete(tmp); } catch { }
+                throw new Exception("The download didn't match its published SHA-256 hash, so it was thrown away.");
+            }
+
+            try { File.Delete(old); } catch { }
+            File.Move(exe, old);                       // allowed while running
+            try { File.Move(tmp, exe); }
+            catch { File.Move(old, exe); throw; }      // put the original back
+        }
+
+        public static void CleanUpOld()
+        {
+            string old = Application.ExecutablePath + ".old";
+            for (int i = 0; i < 20 && File.Exists(old); i++)
+            {
+                try { File.Delete(old); } catch { Thread.Sleep(250); }
+            }
+            try { File.Delete(Application.ExecutablePath + ".download"); } catch { }
+        }
+    }
+
     // ---------------------------------------------------------------- Win32
     static class Native
     {
@@ -879,6 +1292,20 @@ namespace DogeBuddy
             public int bmiColors;
         }
 
+        [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize, dwTime; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public int cbSize, flags;
+            public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+            public RECT rcCaret;
+        }
+        [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO lii);
+        [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO gti);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+        [DllImport("oleacc.dll")]
+        public static extern int AccessibleObjectFromWindow(IntPtr h, uint id, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
         [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
