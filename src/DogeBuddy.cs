@@ -20,7 +20,7 @@ using System.Web.Script.Serialization;
 
 [assembly: AssemblyTitle("DogeBuddy")]
 [assembly: AssemblyProduct("DogeBuddy")]
-[assembly: AssemblyVersion("1.12.1.0")]
+[assembly: AssemblyVersion("1.13.3.0")]
 
 namespace DogeBuddy
 {
@@ -56,6 +56,7 @@ namespace DogeBuddy
                 {
                     Updater.CleanUpOld();
                     try { Native.SetProcessDPIAware(); } catch { }
+                    Native.NoPowerThrottling();
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     var form = new PetForm();
@@ -188,12 +189,12 @@ namespace DogeBuddy
     class PetForm : Form
     {
         Settings cfg;
-        Bitmap srcBody, srcHover, srcEyes, srcHalf, srcClosed, srcMiffed, srcHappy;
+        Bitmap srcBody, srcHover, srcEyes, srcHalf, srcClosed, srcMiffed, srcHappy, srcHeld;
         Bitmap[] srcOutfits = new Bitmap[OutfitCount + 1];
         const int OutfitCount = 7;
 
         // scaled assets for current zoom
-        Bitmap body, hover, eyes, outfit, half, closed, miffed, happy;
+        Bitmap body, hover, eyes, outfit, half, closed, miffed, happy, held;
         PointF bodyPos, eyesPos, outfitPos;
         PointF eyeCenter;
         float eyeMax, eyeDiv;
@@ -215,6 +216,7 @@ namespace DogeBuddy
         static readonly Random rng = new Random();
         Point lastCursor;
         int lastMoveTick, nextBlinkTick, blinkStart = -1, sleepStart = -1;
+        int blinkPhase, phaseStart; bool phaseShown;   // 1 = half, 2 = shut, 3 = half; each step is drawn at least once
         float lastLid = -1; int lastZ = -1;
         const int BlinkMs = 190; // half 0-50, closed 50-140, half 140-190
 
@@ -222,8 +224,16 @@ namespace DogeBuddy
         int miffedUntil, groggyUntil;            // tick deadlines (0 = off)
         List<int> pokes = new List<int>();       // recent click times
         int shakeTurns, shakeDir, shakeLastX;    // direction changes while dragging
+        List<int> shakeTimes = new List<int>();  // when each hard direction change happened
+        bool shakeAngry;                         // shaken hard enough to get cross (beats the fun open mouth)
+        const int ShakeSwing = 40, ShakeTurnsToAnger = 6, ShakeWindowMs = 1500;
         bool clickWoke;                          // this click woke it up; don't count it as a poke
-        bool lastMiffed, lastHappy;
+        bool lastMiffed, lastHappy, lastWild, lastCross;
+
+        // carried: mouth ajar; swung hard: mouth wide open ("weee")
+        float dragVy; int lastDragY, wildUntil, weeAfterDrop;
+        const int WeeHoldMs = 700, WeeAfterDropMs = 900;   // how long the "weee" face lingers
+        const float WildSpeed = 1600f;   // px/s at Normal size
 
         // smoothed eyes
         float eyeX, eyeY; int lastEyeTick;
@@ -287,6 +297,7 @@ namespace DogeBuddy
             srcClosed = LoadPng("DogBlinkClosed.png");
             srcMiffed = LoadPng("DogMiffed.png");
             srcHappy = LoadPng("DogHappy.png");
+            srcHeld = LoadPng("DogOpenM.png");
             for (int i = 1; i <= OutfitCount; i++) srcOutfits[i] = LoadPng("Clothing" + i + ".png");
 
             // union of every layer so the doge's feet stay put whatever it wears
@@ -430,7 +441,7 @@ namespace DogeBuddy
         void ApplyZoom()
         {
             float z = cfg.Zoom;
-            DisposeIf(ref body); DisposeIf(ref hover); DisposeIf(ref eyes); DisposeIf(ref half); DisposeIf(ref closed); DisposeIf(ref miffed); DisposeIf(ref happy);
+            DisposeIf(ref body); DisposeIf(ref hover); DisposeIf(ref eyes); DisposeIf(ref half); DisposeIf(ref closed); DisposeIf(ref miffed); DisposeIf(ref happy); DisposeIf(ref held);
             body = Scale(srcBody, Geo.BodyRect(srcBody.Size), z, out bodyPos, bounds);
             PointF dummy;
             hover = Scale(srcHover, Geo.BodyRect(srcHover.Size), z, out dummy, bounds);
@@ -438,6 +449,7 @@ namespace DogeBuddy
             closed = Scale(srcClosed, Geo.BodyRect(srcClosed.Size), z, out dummy, bounds);
             miffed = Scale(srcMiffed, Geo.BodyRect(srcMiffed.Size), z, out dummy, bounds);
             happy = Scale(srcHappy, Geo.BodyRect(srcHappy.Size), z, out dummy, bounds);
+            held = Scale(srcHeld, Geo.BodyRect(srcHeld.Size), z, out dummy, bounds);
             eyes = Scale(srcEyes, Geo.Eyes, z, out eyesPos, bounds);
             eyeCenter = new PointF(eyesPos.X + eyes.Width / 2f, eyesPos.Y + eyes.Height / 2f);
             eyeMax = Geo.EyeMax * z;
@@ -580,14 +592,17 @@ namespace DogeBuddy
             }
             ox = (float)Math.Round(eyeX * 8) / 8f; oy = (float)Math.Round(eyeY * 8) / 8f;
 
-            bool hov = dragging; // mouth open only while being carried around
+            bool wee = !dragging && Before(now, weeAfterDrop) && !Miffed(now);
+            bool hov = dragging || wee;
+            bool wild = (dragging && Before(now, wildUntil)) || wee;
+            bool cross = dragging && shakeAngry;
             bool mf = !dragging && Miffed(now);
             bool hp = !dragging && !mf && Happy(now);
             float ang = (float)Math.Round(angle * 10) / 10f;
             float lid = LidAmount(now);
             int zf = sleepStart >= 0 && now - sleepStart > 2500 ? ((now - sleepStart) / 100) : -1;
-            if (!force && ox == lastDx && oy == lastDy && hov == lastHover && lid == lastLid && zf == lastZ && mf == lastMiffed && hp == lastHappy && ang == lastAngle) return;
-            lastDx = ox; lastDy = oy; lastHover = hov; lastLid = lid; lastZ = zf; lastMiffed = mf; lastHappy = hp; lastAngle = ang;
+            if (!force && ox == lastDx && oy == lastDy && hov == lastHover && wild == lastWild && cross == lastCross && lid == lastLid && zf == lastZ && mf == lastMiffed && hp == lastHappy && ang == lastAngle) { phaseShown = true; return; }
+            lastDx = ox; lastDy = oy; lastHover = hov; lastWild = wild; lastCross = cross; lastLid = lid; lastZ = zf; lastMiffed = mf; lastHappy = hp; lastAngle = ang;
 
             using (var g = Graphics.FromImage(canvas))
             {
@@ -607,7 +622,7 @@ namespace DogeBuddy
                 }
                 g.DrawImage(eyes, eyesPos.X + ox, eyesPos.Y + oy, eyes.Width, eyes.Height);
                 g.InterpolationMode = ang != 0 ? InterpolationMode.Bilinear : InterpolationMode.NearestNeighbor;
-                Bitmap face = hov ? hover : mf ? miffed : hp ? happy : lid >= 0.75f ? closed : lid > 0.25f ? half : body;
+                Bitmap face = hov ? (cross ? miffed : wild ? hover : held) : mf ? miffed : hp ? happy : lid >= 0.75f ? closed : lid > 0.25f ? half : body;
                 g.DrawImage(face, (int)bodyPos.X, (int)bodyPos.Y, face.Width, face.Height);
                 if (outfit != null) g.DrawImage(outfit, (int)outfitPos.X, (int)outfitPos.Y, outfit.Width, outfit.Height);
                 g.ResetTransform();
@@ -622,6 +637,7 @@ namespace DogeBuddy
             var blend = new Native.BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = 1 };
             Native.UpdateLayeredWindow(Handle, screen, ref dst, ref sz, memDC, ref src, 0, ref blend, 2);
             Native.ReleaseDC(IntPtr.Zero, screen);
+            phaseShown = true;
         }
 
         // ------------------------------------------------------------ blinking & napping
@@ -643,7 +659,7 @@ namespace DogeBuddy
             if (groggyUntil != 0 && !Groggy(now))
             {
                 groggyUntil = 0;
-                blinkStart = now - 50;               // eyes pop open
+                StartBlink(now, 2);                  // eyes pop open from shut
                 nextBlinkTick = now + 2500 + rng.Next(4000);
             }
             if (miffedUntil != 0 && !Miffed(now))
@@ -689,15 +705,22 @@ namespace DogeBuddy
             }
             if (sleepStart < 0)
             {
-                if (blinkStart >= 0 && now - blinkStart >= BlinkMs) blinkStart = -1;
+                if (blinkStart >= 0 && phaseShown && now - phaseStart >= (blinkPhase == 2 ? 90 : 50))
+                {
+                    // advance only once the current step has actually been on screen (laptops can throttle our timer)
+                    blinkPhase++; phaseStart = now; phaseShown = false;
+                    if (blinkPhase > 3) { blinkStart = -1; blinkPhase = 0; }
+                }
                 if (blinkStart < 0 && now - nextBlinkTick >= 0 && !lastHover && !Miffed(now) && !Groggy(now) && !Happy(now))
                 {
-                    blinkStart = now;
+                    StartBlink(now, 1);
                     // sometimes a quick double blink
                     nextBlinkTick = rng.Next(6) == 0 ? now + BlinkMs + 120 : now + 3000 + rng.Next(4500);
                 }
             }
         }
+
+        void StartBlink(int now, int phase) { blinkStart = now; blinkPhase = phase; phaseStart = now; phaseShown = false; }
 
         // 0 = open, 1 = shut
         float LidAmount(int now)
@@ -709,11 +732,7 @@ namespace DogeBuddy
                 l = t < 2.0f ? 0.5f : 1f;                            // drowsy, then asleep
             }
             else if (Groggy(now)) l = 0.5f;
-            else if (blinkStart >= 0)
-            {
-                int t = now - blinkStart;
-                l = t < 50 ? 0.5f : t < 140 ? 1f : t < BlinkMs ? 0.5f : 0f;
-            }
+            else if (blinkStart >= 0) l = blinkPhase == 2 ? 1f : 0.5f;
             return (float)Math.Round(l * 12) / 12f;
         }
 
@@ -954,7 +973,7 @@ namespace DogeBuddy
             if (e.Button == MouseButtons.Left)
             {
                 leftDown = true; dragging = false;
-                dragVx = 0; lastDragTick = 0;
+                dragVx = 0; dragVy = 0; wildUntil = 0; weeAfterDrop = 0; lastDragTick = 0;
                 dragStart = Cursor.Position; winStart = new Point(winX, winY);
                 if (Math.Abs(angle) < 0.5f)
                 {
@@ -963,7 +982,7 @@ namespace DogeBuddy
                     float com = bodyPos.Y + body.Height * 0.55f;
                     grabLever = Math.Max(-1f, Math.Min(1f, (com - pivotY) / (body.Height * 0.45f)));
                 }
-                shakeTurns = 0; shakeDir = 0; shakeLastX = dragStart.X;
+                shakeTurns = 0; shakeDir = 0; shakeLastX = dragStart.X; shakeTimes.Clear(); shakeAngry = false;
                 Capture = true;
                 int now = Environment.TickCount;
                 clickWoke = sleepStart >= 0 || Groggy(now);
@@ -986,8 +1005,14 @@ namespace DogeBuddy
             Point c = Cursor.Position;
             {
                 int now = Environment.TickCount, dtm = Math.Max(1, now - lastDragTick);
-                if (lastDragTick != 0 && dtm < 200) dragVx = dragVx * 0.6f + 0.4f * ((c.X - lastDragX) * 1000f / dtm);
-                lastDragTick = now; lastDragX = c.X;
+                if (lastDragTick != 0 && dtm < 200)
+                {
+                    dragVx = dragVx * 0.6f + 0.4f * ((c.X - lastDragX) * 1000f / dtm);
+                    dragVy = dragVy * 0.6f + 0.4f * ((c.Y - lastDragY) * 1000f / dtm);
+                    float speed = (float)Math.Sqrt(dragVx * dragVx + dragVy * dragVy);
+                    if (speed > WildSpeed * cfg.Zoom) wildUntil = NonZero(now + WeeHoldMs);   // stays open a moment after it slows
+                }
+                lastDragTick = now; lastDragX = c.X; lastDragY = c.Y;
             }
             if (!dragging && (Math.Abs(c.X - dragStart.X) > 3 || Math.Abs(c.Y - dragStart.Y) > 3)) dragging = true;
             if (dragging)
@@ -995,9 +1020,18 @@ namespace DogeBuddy
                 // count sharp left/right direction changes = being shaken
                 // shakeLastX tracks the furthest point in the current direction
                 int d = c.X - shakeLastX;
-                if (shakeDir == 0) { if (Math.Abs(d) >= 25) { shakeDir = Math.Sign(d); shakeLastX = c.X; } }
+                // a fast swing is fun (open mouth, from speed); lots of hard back-and-forth in quick succession is a shake (angry)
+                int swing = (int)(ShakeSwing * cfg.Zoom);
+                if (shakeDir == 0) { if (Math.Abs(d) >= swing) { shakeDir = Math.Sign(d); shakeLastX = c.X; } }
                 else if (d * shakeDir > 0) shakeLastX = c.X;
-                else if (Math.Abs(d) >= 25) { shakeTurns++; shakeDir = -shakeDir; shakeLastX = c.X; }
+                else if (Math.Abs(d) >= swing)
+                {
+                    int tnow = Environment.TickCount;
+                    shakeTurns++; shakeDir = -shakeDir; shakeLastX = c.X;
+                    shakeTimes.Add(tnow);
+                    shakeTimes.RemoveAll(t => tnow - t > ShakeWindowMs);
+                    if (shakeTimes.Count >= ShakeTurnsToAnger) shakeAngry = true;
+                }
                 MoveTo(winStart.X + c.X - dragStart.X, winStart.Y + c.Y - dragStart.Y);
             }
         }
@@ -1036,7 +1070,8 @@ namespace DogeBuddy
                 {
                     dragging = false;
                     cfg.X = winX; cfg.Y = winY; cfg.Save();
-                    if (shakeTurns >= 4) GetMiffed(3000);   // you shook it
+                    if (shakeAngry) GetMiffed(3000);   // you shook it: stays cross for a bit after you let go
+                    else if (Before(now, wildUntil)) weeAfterDrop = NonZero(now + WeeAfterDropMs);   // let go mid-swing: keep the weee while it wobbles
                     Render(true);
                 }
                 else if (!clickWoke)
@@ -1354,6 +1389,19 @@ namespace DogeBuddy
         [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
         [DllImport("oleacc.dll")]
         public static extern int AccessibleObjectFromWindow(IntPtr h, uint id, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object obj);
+        [StructLayout(LayoutKind.Sequential)] struct PROCESS_POWER_THROTTLING_STATE { public uint Version, ControlMask, StateMask; }
+        [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll")] static extern bool SetProcessInformation(IntPtr h, int cls, ref PROCESS_POWER_THROTTLING_STATE info, int size);
+        // Laptops on battery slow down background apps' timers (EcoQoS), which can swallow quick animations like blinks.
+        public static void NoPowerThrottling()
+        {
+            try
+            {
+                var st = new PROCESS_POWER_THROTTLING_STATE { Version = 1, ControlMask = 1 /* EXECUTION_SPEED */, StateMask = 0 /* off */ };
+                SetProcessInformation(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, ref st, Marshal.SizeOf(typeof(PROCESS_POWER_THROTTLING_STATE)));
+            }
+            catch { } // older Windows: not available, nothing to do
+        }
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
         [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);

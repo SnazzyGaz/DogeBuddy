@@ -15,7 +15,7 @@ Originally a Rainmeter skin (*DogeEyes*), rebuilt as a standalone Windows app. *
 - 🌿 Sways gently in place now and then
 - ⌨️ Glances at your text cursor while you type
 - 🤚 Rub its head and it gets happy
-- 😮 Opens its mouth when you pick it up, leans as you carry it, and wobbles when you put it down
+- 😮 Mouth drops open when you carry it, goes full "weee" when you swing it hard, leans as you carry it, and wobbles when you put it down
 - 🖥️ Stays above the taskbar and hides itself when a fullscreen game or video is open
 - 🪶 Light: one ~1 MB exe, near-zero CPU when idle
 - 🔄 Built-in updater: *Check for updates...* in the menu fetches the latest release and swaps itself in place
