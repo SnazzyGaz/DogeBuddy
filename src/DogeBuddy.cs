@@ -20,7 +20,7 @@ using System.Web.Script.Serialization;
 
 [assembly: AssemblyTitle("DogeBuddy")]
 [assembly: AssemblyProduct("DogeBuddy")]
-[assembly: AssemblyVersion("1.13.3.0")]
+[assembly: AssemblyVersion("1.14.1.0")]
 
 namespace DogeBuddy
 {
@@ -77,13 +77,14 @@ namespace DogeBuddy
     class Settings
     {
         public int Outfit = 0;          // 0 = none, 1..7
+        public int Hat = 0;             // 0 = none, 1..N (worn on top of any outfit)
         public float Zoom = 1.0f;       // 1.0 = same size as the Rainmeter skin
         public int X = int.MinValue, Y = int.MinValue;
         public bool Locked = false;
         public bool HideFullscreen = true;
         public bool Tray = true;
         public int NapMinutes = 2;      // 0 = never
-        public int LayoutVer = 1;       // 2 = window has side padding for tilting
+        public int LayoutVer = 1;       // 2 = side padding for tilting, 4 = current hat set
 
         static string AppData { get { return Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData); } }
         static string Dir { get { return Path.Combine(AppData, "DogeBuddy"); } }
@@ -107,6 +108,7 @@ namespace DogeBuddy
                     switch (k)
                     {
                         case "Outfit": int.TryParse(v, out s.Outfit); break;
+                        case "Hat": int.TryParse(v, out s.Hat); break;
                         case "Zoom": float.TryParse(v, NumberStyles.Float, ci, out s.Zoom); break;
                         case "X": int.TryParse(v, out s.X); break;
                         case "Y": int.TryParse(v, out s.Y); break;
@@ -132,6 +134,7 @@ namespace DogeBuddy
                 var ci = CultureInfo.InvariantCulture;
                 var sb = new StringBuilder();
                 sb.AppendLine("Outfit=" + Outfit);
+                sb.AppendLine("Hat=" + Hat);
                 sb.AppendLine("Zoom=" + Zoom.ToString(ci));
                 sb.AppendLine("X=" + X);
                 sb.AppendLine("Y=" + Y);
@@ -155,6 +158,20 @@ namespace DogeBuddy
         public const float EyeMax = 5 * S;   // max pupil travel
         public const float EyeDiv = 12 * S;  // distance divisor near the eyes
         public const float TiltPad = 28;     // spare room either side so the doge can lean
+
+        // hats: worn on the head on top of any outfit. Positions are in DogImage.png pixels
+        // (negative y = above the art). RSB/RSG are full-canvas overlays on DogImage.png.
+        public static readonly string[] HatNames = {
+            "No hat",
+            "Blue Partyhat",
+            "Green Partyhat" };
+        public static readonly RectangleF[] HatRects = {
+            RectangleF.Empty,
+            new RectangleF(0, 0, 130, 225),
+            new RectangleF(0, 0, 130, 225) };
+        // area the v1.14 test hats covered; used once to move a v1.14 window back
+        public static readonly RectangleF V14Hats = new RectangleF(-6, -12, 142, 175);
+        public static int HatCount { get { return HatNames.Length - 1; } }
         public const float MaxTilt = 6;      // degrees
 
         public static readonly string[] OutfitNames = {
@@ -191,6 +208,9 @@ namespace DogeBuddy
         Settings cfg;
         Bitmap srcBody, srcHover, srcEyes, srcHalf, srcClosed, srcMiffed, srcHappy, srcHeld;
         Bitmap[] srcOutfits = new Bitmap[OutfitCount + 1];
+        Bitmap[] srcHats;
+        Bitmap hat; PointF hatPos;
+        PointF oldOrigin, v14Origin;   // where the window's top-left used to sit before hats made it taller
         const int OutfitCount = 7;
 
         // scaled assets for current zoom
@@ -299,11 +319,19 @@ namespace DogeBuddy
             srcHappy = LoadPng("DogHappy.png");
             srcHeld = LoadPng("DogOpenM.png");
             for (int i = 1; i <= OutfitCount; i++) srcOutfits[i] = LoadPng("Clothing" + i + ".png");
+            srcHats = new Bitmap[Geo.HatCount + 1];
+            srcHats[1] = LoadPng("RSB.png");
+            srcHats[2] = LoadPng("RSG.png");
+            if (cfg.Hat < 0 || cfg.Hat > Geo.HatCount) cfg.Hat = 0;
 
             // union of every layer so the doge's feet stay put whatever it wears
             bounds = Geo.BodyRect(srcBody.Size);
             bounds = RectangleF.Union(bounds, Geo.Eyes);
             for (int i = 1; i <= OutfitCount; i++) bounds = RectangleF.Union(bounds, Geo.OutfitRect(i, srcOutfits[i].Size));
+            oldOrigin = new PointF(bounds.X - Geo.TiltPad, bounds.Y);
+            var v14 = RectangleF.Union(bounds, Geo.V14Hats);
+            v14Origin = new PointF(v14.X - Geo.TiltPad, v14.Y);
+            for (int i = 1; i <= Geo.HatCount; i++) bounds = RectangleF.Union(bounds, Geo.HatRects[i]);
             bounds = new RectangleF(bounds.X - Geo.TiltPad, bounds.Y, bounds.Width + 2 * Geo.TiltPad, bounds.Height);
             lastMoveTick = Environment.TickCount;
             nextBlinkTick = lastMoveTick + 3000;
@@ -455,9 +483,17 @@ namespace DogeBuddy
             eyeMax = Geo.EyeMax * z;
             eyeDiv = Geo.EyeDiv * z;
             ApplyOutfit();
+            ApplyHat();
 
             int nw = (int)Math.Ceiling(bounds.Width * z) + 2, nh = (int)Math.Ceiling(bounds.Height * z) + 2;
             if (nw != cw || nh != ch) CreateBuffer(nw, nh);
+            lastDx = float.NaN;
+        }
+
+        void ApplyHat()
+        {
+            DisposeIf(ref hat);
+            if (cfg.Hat > 0) hat = Scale(srcHats[cfg.Hat], Geo.HatRects[cfg.Hat], cfg.Zoom, out hatPos, bounds);
             lastDx = float.NaN;
         }
 
@@ -509,6 +545,25 @@ namespace DogeBuddy
                 // the window got wider on both sides; keep the doge where it was
                 if (cfg.X != int.MinValue) cfg.X -= (int)Math.Round(Geo.TiltPad * cfg.Zoom);
                 cfg.LayoutVer = 2; cfg.Save();
+            }
+            if (cfg.LayoutVer < 3)
+            {
+                if (cfg.X != int.MinValue)
+                {
+                    cfg.X -= (int)Math.Round((oldOrigin.X - (bounds.X)) * cfg.Zoom);
+                    cfg.Y -= (int)Math.Round((oldOrigin.Y - bounds.Y) * cfg.Zoom);
+                }
+                cfg.LayoutVer = 4; cfg.Save();
+            }
+            else if (cfg.LayoutVer == 3)
+            {
+                // v1.14 window was sized for the test hats; keep the doge where it was
+                if (cfg.X != int.MinValue)
+                {
+                    cfg.X -= (int)Math.Round((v14Origin.X - bounds.X) * cfg.Zoom);
+                    cfg.Y -= (int)Math.Round((v14Origin.Y - bounds.Y) * cfg.Zoom);
+                }
+                cfg.LayoutVer = 4; cfg.Save();
             }
             if (cfg.X == int.MinValue || !OnAnyScreen(new Rectangle(cfg.X, cfg.Y, cw, ch)))
                 DefaultPosition();
@@ -625,6 +680,7 @@ namespace DogeBuddy
                 Bitmap face = hov ? (cross ? miffed : wild ? hover : held) : mf ? miffed : hp ? happy : lid >= 0.75f ? closed : lid > 0.25f ? half : body;
                 g.DrawImage(face, (int)bodyPos.X, (int)bodyPos.Y, face.Width, face.Height);
                 if (outfit != null) g.DrawImage(outfit, (int)outfitPos.X, (int)outfitPos.Y, outfit.Width, outfit.Height);
+                if (hat != null) g.DrawImage(hat, (int)hatPos.X, (int)hatPos.Y, hat.Width, hat.Height);
                 g.ResetTransform();
                 if (zf >= 0) DrawZzz(g, now - sleepStart - 2500);
             }
@@ -1128,6 +1184,7 @@ namespace DogeBuddy
 
         // ------------------------------------------------------------ menu
         ToolStripMenuItem[] outfitItems = new ToolStripMenuItem[OutfitCount + 1];
+        ToolStripMenuItem[] hatItems;
         List<KeyValuePair<float, ToolStripMenuItem>> sizeItems = new List<KeyValuePair<float, ToolStripMenuItem>>();
         ToolStripMenuItem miLock, miFull, miStartup, miTray, napMenu;
 
@@ -1147,7 +1204,19 @@ namespace DogeBuddy
             }
             KeepOnScreen(outfits);
             menu.Items.Add(outfits);
+            var hats = new ToolStripMenuItem("Hat");
+            hatItems = new ToolStripMenuItem[Geo.HatCount + 1];
+            for (int i = 0; i <= Geo.HatCount; i++)
+            {
+                int n = i;
+                hatItems[i] = new ToolStripMenuItem(Geo.HatNames[i], null, (s, e) => SetHat(n));
+                hats.DropDownItems.Add(hatItems[i]);
+                if (i == 0) hats.DropDownItems.Add(new ToolStripSeparator());
+            }
+            KeepOnScreen(hats);
+            menu.Items.Add(hats);
             menu.Items.Add(new ToolStripMenuItem("Next outfit", null, (s, e) => SetOutfit((cfg.Outfit + 1) % (OutfitCount + 1))));
+            menu.Items.Add(new ToolStripMenuItem("Next hat", null, (s, e) => SetHat((cfg.Hat + 1) % (Geo.HatCount + 1))));
 
             var size = new ToolStripMenuItem("Size");
             foreach (var p in new[] { new KeyValuePair<string, float>("Small", 0.6f),
@@ -1193,12 +1262,20 @@ namespace DogeBuddy
         void UpdateMenuChecks()
         {
             for (int i = 0; i <= OutfitCount; i++) outfitItems[i].Checked = cfg.Outfit == i;
+            for (int i = 0; i <= Geo.HatCount; i++) hatItems[i].Checked = cfg.Hat == i;
             foreach (var p in sizeItems) p.Value.Checked = Math.Abs(p.Key - cfg.Zoom) < 0.01f;
             miLock.Checked = cfg.Locked;
             miFull.Checked = cfg.HideFullscreen;
             miStartup.Checked = GetStartup();
             miTray.Checked = cfg.Tray;
             foreach (ToolStripMenuItem it in napMenu.DropDownItems) it.Checked = (int)it.Tag == cfg.NapMinutes;
+        }
+
+        void SetHat(int n)
+        {
+            cfg.Hat = n; cfg.Save();
+            ApplyHat();
+            Render(true);
         }
 
         void SetOutfit(int n)
